@@ -1,31 +1,32 @@
 """
-Testing-Bias Simulator (Vaccine Effectiveness) — single-file version
+Testing-Bias Simulator (VE) — clean version with explanatory notes.
 
 What this script shows:
-- How differences in care-seeking behavior and test accuracy can bias vaccine effectiveness (VE)
-- Comparison of two estimators:
-    1) Test-Negative Design (TND) — uses only people who sought a test
-    2) Target-Trial Emulation (TTE) — compares infection risk in the whole cohort
+- How differential care-seeking and imperfect tests can bias vaccine effectiveness (VE)
+  under two approaches: Test-Negative Design (TND) and Target-Trial Emulation (TTE).
 
-How to use:
-- Run this file (e.g., python simulate_bias.py) to print example VE numbers
-- It will also generate two heatmaps in ./figures/:
-    - bias_heatmap_TND.png
-    - bias_heatmap_TTE.png
+Only standard libraries used: numpy, pandas (for convenience).
+No plotting here; this file focuses on the core logic and reproducible calculations.
 """
 
-# ----------------------------
-# Imports
-# ----------------------------
-import os
+from __future__ import annotations
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 
-# ----------------------------
-# Population & behavior models
-# ----------------------------
+# -----------------------------
+# Utility: reproducible RNG
+# -----------------------------
+def _rng(seed: int | None = None) -> np.random.Generator:
+    """
+    Creates a NumPy random number generator. Using a seed makes runs reproducible.
+    """
+    return np.random.default_rng(seed)
+
+
+# ----------------------------------------------------
+# 1) Population generator (exposure, outcome, severity)
+# ----------------------------------------------------
 def generate_population(
     N: int = 100_000,
     p_vacc: float = 0.6,
@@ -34,231 +35,230 @@ def generate_population(
     seed: int = 42,
 ) -> pd.DataFrame:
     """
-    Create a synthetic population with vaccination status, true infection, and symptom severity.
+    Builds a synthetic cohort:
+      - vacc: 1 if vaccinated, else 0
+      - infected_true: 1 if truly infected, else 0
+      - severity: continuous symptom severity in [0,1] (higher ~ worse symptoms)
 
-    Parameters
-    ----------
-    N : total number of people
-    p_vacc : fraction vaccinated
-    true_VE : true vaccine effectiveness (reduces infection probability for vaccinated)
-    base_prev : baseline infection prevalence without vaccination
-    seed : random seed for reproducibility
-
-    Returns
-    -------
-    DataFrame with columns:
-      - vacc (0/1)
-      - infected_true (0/1)
-      - severity (0..1, higher ~ more symptoms)
+    Assumptions:
+      - Vaccination reduces infection probability by 'true_VE' multiplicatively.
+      - Severity skews higher for truly infected individuals.
     """
-    rng = np.random.default_rng(seed)
+    rng = _rng(seed)
 
-    # Vaccination assignment
+    # Exposure: who is vaccinated
     vacc = (rng.random(N) < p_vacc).astype(int)
 
-    # True infection probability is reduced for vaccinated by true_VE
-    p_inf = base_prev * (1 - true_VE * vacc)
+    # True infection probability is reduced for vaccinated
+    p_inf = base_prev * (1.0 - true_VE * vacc)
     infected_true = (rng.random(N) < p_inf).astype(int)
 
-    # Symptom severity: base noise + bump if truly infected
-    severity = np.clip(rng.beta(2, 5, size=N) + 0.4 * infected_true, 0, 1)
+    # Severity: start from a mild distribution, bump it up if infected
+    # (beta(2,5) ~ mostly low values; +0.4 for infected shifts severity upward)
+    severity = np.clip(rng.beta(2, 5, size=N) + 0.4 * infected_true, 0.0, 1.0)
 
     return pd.DataFrame(
         {"vacc": vacc, "infected_true": infected_true, "severity": severity}
     )
 
 
+# -------------------------------------------------------
+# 2) Care-seeking behavior (who actually goes to get a test)
+# -------------------------------------------------------
 def care_seek_prob(
     severity: np.ndarray,
     vacc: np.ndarray,
     delta_seek: float = 0.2,
 ) -> np.ndarray:
     """
-    Convert severity and vaccination into a probability of seeking a diagnostic test.
+    Converts severity and vaccination into a probability of seeking a test.
 
-    Idea:
-      - People with higher severity are more likely to seek a test
-      - delta_seek shifts care-seeking for unvaccinated (positive means they seek more)
+    Interpretation:
+      - Base seeking increases with severity (people with worse symptoms tend to seek care).
+      - 'delta_seek' shifts the seeking probability for unvaccinated vs vaccinated:
+          * Positive delta_seek => unvaccinated seek testing more often on average.
+          * Negative delta_seek => unvaccinated seek testing less often on average.
 
-    Returns a vector of probabilities in [0, 1].
+    Returns:
+      - Array of probabilities in [0,1], one per person.
     """
     severity = np.asarray(severity)
     vacc = np.asarray(vacc)
 
-    # Base relationship: low severity ~ ~10% seek; high severity ~ ~80% seek
-    base = 0.1 + 0.7 * severity
-
-    # Shift unvaccinated seeking up or down by delta_seek
-    # (1 - vacc) is 1 for unvaccinated, 0 for vaccinated
-    adjusted = base + delta_seek * (1 - vacc)
-
-    return np.clip(adjusted, 0.0, 1.0)
+    base = 0.10 + 0.70 * severity  # low at 0, high near 1
+    # Adjust unvaccinated: (1 - vacc) is 1 for unvaccinated, 0 for vaccinated
+    adj = base + delta_seek * (1 - vacc)
+    return np.clip(adj, 0.0, 1.0)
 
 
+# -------------------------------------------------------
+# 3) Imperfect diagnostic testing (sensitivity / specificity)
+# -------------------------------------------------------
 def apply_test(
     infected_true: np.ndarray,
     sens: float = 0.90,
     spec: float = 0.98,
-    rng: np.random.Generator | None = None,
+    seed: int | None = 0,
 ) -> np.ndarray:
     """
-    Simulate a diagnostic test with given sensitivity and specificity.
+    Simulates a diagnostic test result with given sensitivity/specificity.
 
-    Returns a 0/1 array 'test_pos':
-      1 = test returns positive
-      0 = test returns negative
+    Inputs:
+      - infected_true: 1 if truly infected, else 0
+      - sens: probability test is positive if infected (true positive rate)
+      - spec: probability test is negative if not infected (true negative rate)
+
+    Output:
+      - test_pos: 1 if test is positive, else 0
     """
-    rng = rng or np.random.default_rng(0)
+    rng = _rng(seed)
     infected_true = np.asarray(infected_true).astype(int)
     N = len(infected_true)
 
-    # True/false outcomes for each person
-    tp = (rng.random(N) < sens) & (infected_true == 1)  # true positives
-    fn = (rng.random(N) >= sens) & (infected_true == 1)  # false negatives
-    tn = (rng.random(N) < spec) & (infected_true == 0)  # true negatives
-    fp = (rng.random(N) >= spec) & (infected_true == 0)  # false positives
+    # True positives & false negatives for infected people
+    is_infected = infected_true == 1
+    tp = (rng.random(N) < sens) & is_infected
+    fn = (~tp) & is_infected  # not used directly, here for clarity
+
+    # True negatives & false positives for non-infected people
+    not_infected = ~is_infected
+    tn = (rng.random(N) < spec) & not_infected
+    fp = (~tn) & not_infected
 
     test_pos = tp | fp
-    # (tn and fn are implicitly 'not positive')
     return test_pos.astype(int)
 
 
-# ----------------------------
-# Effectiveness estimators
-# ----------------------------
+# -------------------------------------------------------
+# 4) Estimators: TND and TTE observed VE
+# -------------------------------------------------------
 def estimate_TND(df: pd.DataFrame) -> float:
     """
-    Test-Negative Design VE estimate.
+    Test-Negative Design VE estimate using seekers only.
 
-    Uses only people who sought testing.
-    Constructs the odds ratio of vaccination among test-positives vs test-negatives,
-    then converts to VE = 1 − OR.
+    2x2 table among those who sought testing:
+        test_pos   test_neg
+    v=1     a         b
+    v=0     c         d
+
+    OR = (a*d)/(b*c); VE = 1 - OR
+    Continuity correction (+0.5) avoids division by zero when any cell is 0.
     """
     sub = df[df["seek"] == 1]
     if len(sub) == 0:
-        return 0.0
+        return float("nan")
 
     a = ((sub["vacc"] == 1) & (sub["test_pos"] == 1)).sum()
     b = ((sub["vacc"] == 1) & (sub["test_pos"] == 0)).sum()
     c = ((sub["vacc"] == 0) & (sub["test_pos"] == 1)).sum()
     d = ((sub["vacc"] == 0) & (sub["test_pos"] == 0)).sum()
 
-    # Continuity correction to avoid division by zero when any cell is 0
     or_est = ((a + 0.5) * (d + 0.5)) / ((b + 0.5) * (c + 0.5))
-    VE_obs = 1 - or_est
-    return float(VE_obs)
+    ve = 1.0 - or_est
+    return float(ve)
 
 
 def estimate_TTE(df: pd.DataFrame) -> float:
     """
-    Target-Trial Emulation VE estimate (idealized).
+    Target-Trial Emulation VE estimate using true infection risk in the full cohort.
 
-    Compares infection risk in vaccinated vs unvaccinated in the whole cohort.
-    VE = 1 − risk_ratio.
+    VE = 1 - RR, where RR = risk_vaccinated / risk_unvaccinated.
+    A tiny epsilon avoids divide-by-zero if a group has zero cases.
     """
+    eps = 1e-6
     risk_v = df.loc[df["vacc"] == 1, "infected_true"].mean()
     risk_u = df.loc[df["vacc"] == 0, "infected_true"].mean()
-    rr = (risk_v + 1e-6) / (risk_u + 1e-6)  # small epsilon to avoid 0/0
-    VE_obs = 1 - rr
-    return float(VE_obs)
+    rr = (risk_v + eps) / (risk_u + eps)
+    ve = 1.0 - rr
+    return float(ve)
 
 
-# ----------------------------
-# Parameter sweep + plotting
-# ----------------------------
-def sweep_and_plot(
-    delta_seek_vals: np.ndarray | None = None,
-    prev_vals: np.ndarray | None = None,
-    true_VE: float = 0.5,
+# -------------------------------------------------------
+# 5) Tiny helper: construct a seeking+testing dataset from a cohort
+# -------------------------------------------------------
+def simulate_observation_process(
+    df: pd.DataFrame,
+    delta_seek: float = 0.2,
     sens: float = 0.90,
     spec: float = 0.98,
-    outdir: str = "figures",
-) -> None:
+    seed: int = 123,
+) -> pd.DataFrame:
     """
-    Explore how observed VE changes across:
-      - delta_seek: how much more (or less) unvaccinated seek tests vs vaccinated
-      - prevalence: baseline infection level in the population
-
-    Saves two heatmaps:
-      - bias_heatmap_TND.png  (observed VE under TND)
-      - bias_heatmap_TTE.png  (observed VE under TTE)
+    Adds 'seek' and 'test_pos' columns to the cohort, representing:
+      - who actually seeks testing (based on severity & vaccination)
+      - who tests positive (based on true infection and test performance)
     """
-    os.makedirs(outdir, exist_ok=True)
+    rng = _rng(seed)
 
-    # Ranges to explore (x-axis = care-seeking difference, y-axis = prevalence)
-    delta_seek_vals = (
-        delta_seek_vals if delta_seek_vals is not None else np.linspace(-0.4, 0.4, 17)
+    # Who seeks testing?
+    pr_seek = care_seek_prob(df["severity"].values, df["vacc"].values, delta_seek=delta_seek)
+    seek = (rng.random(len(df)) < pr_seek).astype(int)
+
+    # Apply test only to seekers
+    test_pos = np.zeros(len(df), dtype=int)
+    idx_seek = seek == 1
+    test_pos[idx_seek] = apply_test(
+        df.loc[idx_seek, "infected_true"].values,
+        sens=sens, spec=spec, seed=seed
     )
-    prev_vals = prev_vals if prev_vals is not None else np.linspace(0.02, 0.25, 10)
 
-    grid_TND = np.zeros((len(prev_vals), len(delta_seek_vals)))
-    grid_TTE = np.zeros_like(grid_TND)
-
-    for i, pv in enumerate(prev_vals):
-        for j, ds in enumerate(delta_seek_vals):
-            # Build population
-            df = generate_population(base_prev=pv, true_VE=true_VE)
-
-            # Who seeks testing?
-            rng = np.random.default_rng(123)
-            pr = care_seek_prob(df["severity"].values, df["vacc"].values, delta_seek=ds)
-            df["seek"] = (rng.random(len(df)) < pr).astype(int)
-
-            # Apply tests for seekers only
-            df["test_pos"] = 0
-            is_seeker = df["seek"] == 1
-            df.loc[is_seeker, "test_pos"] = apply_test(
-                df.loc[is_seeker, "infected_true"].values, sens=sens, spec=spec, rng=rng
-            )
-
-            # Estimates
-            grid_TND[i, j] = estimate_TND(df)
-            grid_TTE[i, j] = estimate_TTE(df)
-
-    # Helper to draw a heatmap
-    def plot_heatmap(M, xvals, yvals, title, outfile):
-        plt.figure()
-        plt.imshow(
-            M,
-            aspect="auto",
-            origin="lower",
-            extent=[xvals[0], xvals[-1], yvals[0], yvals[-1]],
-        )
-        plt.colorbar(label="Observed VE")
-        plt.xlabel("Δ(seeking)  (unvacc − vacc)")
-        plt.ylabel("Prevalence")
-        plt.title(title)
-        plt.tight_layout()
-        plt.savefig(os.path.join(outdir, outfile), dpi=160)
-        plt.close()
-
-    plot_heatmap(grid_TND, delta_seek_vals, prev_vals, "TND Observed VE", "bias_heatmap_TND.png")
-    plot_heatmap(grid_TTE, delta_seek_vals, prev_vals, "TTE Observed VE", "bias_heatmap_TTE.png")
+    out = df.copy()
+    out["seek"] = seek
+    out["test_pos"] = test_pos
+    return out
 
 
-# ----------------------------
-# Example run (safe defaults)
-# ----------------------------
+# -------------------------------------------------------
+# 6) Optional: quick parameter sweep (no plotting, returns a tidy table)
+# -------------------------------------------------------
+def sweep_observed_ve(
+    delta_seek_vals: np.ndarray = np.linspace(-0.4, 0.4, 9),
+    prev_vals: np.ndarray = np.linspace(0.05, 0.25, 5),
+    true_VE: float = 0.5,
+    p_vacc: float = 0.6,
+    sens: float = 0.90,
+    spec: float = 0.98,
+    N: int = 100_000,
+    seed: int = 7,
+) -> pd.DataFrame:
+    """
+    Explores how observed VE changes across care-seeking differentials and prevalence.
+
+    Returns a tidy DataFrame with columns:
+      - prevalence, delta_seek, VE_TND, VE_TTE
+    """
+    rows = []
+    for pv in prev_vals:
+        for ds in delta_seek_vals:
+            pop = generate_population(N=N, p_vacc=p_vacc, true_VE=true_VE, base_prev=pv, seed=seed)
+            obs = simulate_observation_process(pop, delta_seek=ds, sens=sens, spec=spec, seed=seed)
+            ve_tnd = estimate_TND(obs)
+            ve_tte = estimate_TTE(obs)
+            rows.append({"prevalence": pv, "delta_seek": ds, "VE_TND": ve_tnd, "VE_TTE": ve_tte})
+    return pd.DataFrame(rows)
+
+
+# -------------------------------------------------------
+# 7) Minimal demo: prints a couple of numbers so users see it's working
+# -------------------------------------------------------
 if __name__ == "__main__":
-    # Build a population and simulate a single scenario to print some numbers
-    df = generate_population(N=50_000, base_prev=0.10, true_VE=0.5)
+    # Build a cohort with default settings
+    cohort = generate_population(N=50_000, p_vacc=0.6, true_VE=0.5, base_prev=0.10, seed=42)
 
-    # Who seeks testing (unvaccinated seek a bit more: delta_seek=+0.2)
-    rng = np.random.default_rng(999)
-    seek_p = care_seek_prob(df["severity"].values, df["vacc"].values, delta_seek=0.2)
-    df["seek"] = (rng.random(len(df)) < seek_p).astype(int)
-
-    # Apply tests for seekers only (imperfect sensitivity/specificity)
-    df["test_pos"] = 0
-    seekers = df["seek"] == 1
-    df.loc[seekers, "test_pos"] = apply_test(
-        df.loc[seekers, "infected_true"].values, sens=0.90, spec=0.98, rng=rng
+    # Run the observation process: who seeks testing, who tests positive
+    observed = simulate_observation_process(
+        cohort,
+        delta_seek=0.2,     # unvaccinated seek a bit more
+        sens=0.90,          # test sensitivity
+        spec=0.98,          # test specificity
+        seed=123
     )
 
-    # Print observed VE from both methods
-    print("Observed VE (TND):", round(estimate_TND(df), 3))
-    print("Observed VE (TTE):", round(estimate_TTE(df), 3))
+    # Compute observed VE under TND (seekers only) and TTE (full cohort)
+    ve_tnd = estimate_TND(observed)
+    ve_tte = estimate_TTE(observed)
+    print({"VE_TND": round(ve_tnd, 3), "VE_TTE": round(ve_tte, 3)})
 
-    # Create heatmaps to visualize how observed VE changes across settings
-    sweep_and_plot()
-    print("Saved heatmaps to ./figures/")
+    # Optional: small sweep to show trends (comment out if not needed)
+    # results = sweep_observed_ve()
+    # print(results.head())
