@@ -1,54 +1,26 @@
 """
-Plots for Testing-Bias Simulator — generates heatmaps from a parameter sweep.
+Misclassification sweeps for Testing-Bias Simulator.
 
 What this file does:
-- Calls the core simulator to compute observed VE (TND and TTE) over a grid of settings.
-- Converts tidy results to 2D grids.
-- Saves two heatmap PNGs into the repo's figures/ folder.
-- Also saves the full sweep results to CSV for reproducibility.
-
-Why separate file?
-- Keeps plotting isolated so the core logic stays clean and testable.
+- Sweeps over test sensitivity and specificity separately.
+- For each combination, computes observed VE (TND) at different care-seeking differentials.
+- Saves two heatmaps in figures/: misclass_sweep_sens.png and misclass_sweep_spec.png.
 """
 
 from __future__ import annotations
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from bias_simulator.simulate_bias import sweep_observed_ve
-
-
-def _to_grid(df, x_col: str = "delta_seek", y_col: str = "prevalence", z_col: str = "VE_TND"):
-    """
-    Converts a tidy DataFrame (x, y, z columns) into a matrix suitable for heatmaps.
-    - Ensures columns/rows are sorted by x (columns) and y (rows).
-    - Returns (xs, ys, M) where M[i, j] corresponds to y[i], x[j].
-    """
-    xs = np.sort(df[x_col].unique())
-    ys = np.sort(df[y_col].unique())
-
-    # Build matrix M with shape (len(ys), len(xs))
-    M = np.empty((len(ys), len(xs)), dtype=float)
-    for i, y in enumerate(ys):
-        row = df[df[y_col] == y].sort_values(x_col)[z_col].to_numpy()
-        M[i, :] = row
-    return xs, ys, M
-
+from bias_simulator.simulate_bias import (
+    generate_population,
+    simulate_observation_process,
+    estimate_TND,
+)
 
 def _ensure_dir(path: str):
-    """
-    Creates a folder if it doesn't exist (safe to call multiple times).
-    """
     os.makedirs(path, exist_ok=True)
 
-
-def _heatmap(xs, ys, M, title: str, outfile: str):
-    """
-    Saves a simple heatmap figure:
-    - x-axis: care-seeking differential (unvaccinated minus vaccinated).
-    - y-axis: prevalence.
-    - color: observed VE under the chosen estimator.
-    """
+def _heatmap(xs, ys, M, title: str, outfile: str, xlabel: str):
     plt.figure()
     plt.imshow(
         M,
@@ -56,38 +28,54 @@ def _heatmap(xs, ys, M, title: str, outfile: str):
         origin="lower",
         extent=[xs.min(), xs.max(), ys.min(), ys.max()],
     )
-    plt.colorbar(label="Observed VE")
-    plt.xlabel("Δ(seeking) (unvaccinated − vaccinated)")
-    plt.ylabel("Prevalence")
+    plt.colorbar(label="Observed VE (TND)")
+    plt.xlabel(xlabel)
+    plt.ylabel("Δ(seeking) (unvaccinated − vaccinated)")
     plt.title(title)
     plt.tight_layout()
     plt.savefig(outfile, dpi=160)
     plt.close()
 
+def sweep_over_sensitivity(
+    sens_vals=np.linspace(0.75, 0.99, 11),
+    delta_seek_vals=np.linspace(-0.4, 0.4, 17),
+    base_prev=0.10,
+    true_VE=0.5,
+    spec_fixed=0.98,
+    N=80_000,
+    seed=7,
+):
+    grid = np.zeros((len(delta_seek_vals), len(sens_vals)))
+    for i, ds in enumerate(delta_seek_vals):
+        for j, s in enumerate(sens_vals):
+            pop = generate_population(N=N, base_prev=base_prev, true_VE=true_VE, seed=seed+i+j)
+            obs = simulate_observation_process(pop, delta_seek=ds, sens=s, spec=spec_fixed, seed=seed+i+j)
+            grid[i, j] = estimate_TND(obs)
+    return sens_vals, delta_seek_vals, grid
 
-def main():
-    """
-    Runs the sweep, saves CSV + two heatmaps.
-    """
-    results = sweep_observed_ve()  # uses deterministic seeds inside
-
-    # Ensure output directory exists
-    _ensure_dir("figures")
-
-    # Save tidy results for full reproducibility
-    results.to_csv("figures/bias_sweep_results.csv", index=False)
-
-    # Build grids for both estimators
-    xs, ys, grid_tnd = _to_grid(results, z_col="VE_TND")
-    _,  _, grid_tte = _to_grid(results, z_col="VE_TTE")
-
-    # Write out the two required figures
-    _heatmap(xs, ys, grid_tnd, "TND Observed VE", "figures/bias_heatmap_TND.png")
-    _heatmap(xs, ys, grid_tte, "TTE Observed VE", "figures/bias_heatmap_TTE.png")
-
-    print("Saved: figures/bias_heatmap_TND.png, figures/bias_heatmap_TTE.png")
-    print("Saved: figures/bias_sweep_results.csv")
-
+def sweep_over_specificity(
+    spec_vals=np.linspace(0.95, 0.995, 11),
+    delta_seek_vals=np.linspace(-0.4, 0.4, 17),
+    base_prev=0.10,
+    true_VE=0.5,
+    sens_fixed=0.90,
+    N=80_000,
+    seed=13,
+):
+    grid = np.zeros((len(delta_seek_vals), len(spec_vals)))
+    for i, ds in enumerate(delta_seek_vals):
+        for j, sp in enumerate(spec_vals):
+            pop = generate_population(N=N, base_prev=base_prev, true_VE=true_VE, seed=seed+i+j)
+            obs = simulate_observation_process(pop, delta_seek=ds, sens=sens_fixed, spec=sp, seed=seed+i+j)
+            grid[i, j] = estimate_TND(obs)
+    return spec_vals, delta_seek_vals, grid
 
 if __name__ == "__main__":
-    main()
+    _ensure_dir("figures")
+    xs, ys, M = sweep_over_sensitivity()
+    _heatmap(xs, ys, M, "Observed VE (TND) vs Sensitivity", "figures/misclass_sweep_sens.png", "Sensitivity")
+
+    xs, ys, M = sweep_over_specificity()
+    _heatmap(xs, ys, M, "Observed VE (TND) vs Specificity", "figures/misclass_sweep_spec.png", "Specificity")
+
+    print("Saved: figures/misclass_sweep_sens.png, figures/misclass_sweep_spec.png")
