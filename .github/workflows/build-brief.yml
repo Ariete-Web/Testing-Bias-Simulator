@@ -1,10 +1,11 @@
-name: Build brief PDF
+name: Build brief PDF and figures
 
 on:
   workflow_dispatch:
   push:
     paths:
       - "reports/brief.md"
+      - "bias_simulator/**.py"
       - ".github/workflows/build-brief.yml"
 
 permissions:
@@ -17,39 +18,53 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Install pandoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pandoc
-
-      - name: Convert brief to PDF
-        run: |
-          pandoc reports/brief.md -o reports/brief.pdf
-
-      - name: Commit PDF
-        uses: EndBug/add-and-commit@v9
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          add: "reports/brief.pdf"
-          message: "chore: update brief PDF (auto)"
+          python-version: "3.11"
 
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-name: Build brief PDF
-on:
-  workflow_dispatch:
-  push:
-    paths:
-      - "reports/brief.md"
-      - ".github/workflows/build-brief.yml"
+      - name: Configure matplotlib backend
+        run: |
+          echo "MPLBACKEND=Agg" >> $GITHUB_ENV
 
-permissions:
-  contents: write
+      - name: Create figures directory
+        run: |
+          mkdir -p figures
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@v4
+      - name: Generate TND/TTE heatmaps
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -e
+          echo "Generating TND/TTE heatmaps..."
+          python bias_simulator/make_plots.py
+          echo "Heatmaps generated successfully"
+          ls -la figures/
+
+      - name: Generate misclassification sweeps
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -e
+          echo "Generating misclassification sweeps..."
+          python bias_simulator/misclass_plots.py
+          echo "Misclassification sweeps generated successfully"
+          ls -la figures/
+
+      - name: Verify generated files
+        run: |
+          echo "Verifying generated files..."
+          test -f figures/bias_heatmap_TND.png || { echo "Error: bias_heatmap_TND.png not found"; exit 1; }
+          test -f figures/bias_heatmap_TTE.png || { echo "Error: bias_heatmap_TTE.png not found"; exit 1; }
+          test -f figures/bias_sweep_results.csv || { echo "Error: bias_sweep_results.csv not found"; exit 1; }
+          test -f figures/misclass_sweep_sens.png || { echo "Error: misclass_sweep_sens.png not found"; exit 1; }
+          test -f figures/misclass_sweep_spec.png || { echo "Error: misclass_sweep_spec.png not found"; exit 1; }
+          echo "All required files generated successfully!"
 
       - name: Install pandoc
         run: |
@@ -64,9 +79,9 @@ jobs:
         run: |
           pandoc reports/brief.md -o reports/brief.pdf --pdf-engine=xelatex
 
-      - name: Commit PDF
+      - name: Commit figures and PDF
         uses: EndBug/add-and-commit@v9
         with:
-          add: "reports/brief.pdf"
-          message: "chore: update brief PDF (auto)"
+          add: "figures/* reports/brief.pdf"
+          message: "chore: update figures and brief PDF (auto)"
 
