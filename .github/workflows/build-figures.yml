@@ -1,14 +1,14 @@
 name: Build figures (bias simulator)
 
 on:
-  workflow_dispatch: {}   # lets you click "Run workflow" by hand
+  workflow_dispatch: {}   # you can click "Run workflow"
   push:
     paths:
       - "bias_simulator/**.py"
       - ".github/workflows/build-figures.yml"
 
 permissions:
-  contents: write        # allow the workflow to commit figures back
+  contents: write
 
 jobs:
   build:
@@ -27,9 +27,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy pandas matplotlib
 
-      - name: Generate heatmaps
+      - name: Generate TND/TTE heatmaps
         run: |
           python bias_simulator/make_plots.py
+
+      - name: Generate misclassification sweeps
+        run: |
+          python bias_simulator/misclass_plots.py
 
       - name: Commit figures
         uses: EndBug/add-and-commit@v9
