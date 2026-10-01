@@ -126,10 +126,15 @@ def estimate_TND(df: pd.DataFrame) -> float:
 def estimate_TTE(df: pd.DataFrame) -> float:
     """
     TTE (full cohort): VE = 1 - RR, with RR = risk_vaccinated / risk_unvaccinated.
+    Risk uses the observed outcome (test_pos among the full cohort, with
+    non-seekers counted as undetected) rather than the unobservable true
+    infection status. This keeps TTE a full-cohort comparator (no selection
+    on care-seeking, unlike TND) while still exposing it to the same
+    under-ascertainment bias a real target-trial emulation would face.
     """
     eps = 1e-6
-    risk_v = df.loc[df["vacc"] == 1, "infected_true"].mean()
-    risk_u = df.loc[df["vacc"] == 0, "infected_true"].mean()
+    risk_v = df.loc[df["vacc"] == 1, "test_pos"].mean()
+    risk_u = df.loc[df["vacc"] == 0, "test_pos"].mean()
     rr = (risk_v + eps) / (risk_u + eps)
     return float(1.0 - rr)
 
@@ -149,15 +154,25 @@ def simulate_observation_process(
       - 'seek' indicates who actually goes for testing
       - 'test_pos' is the observed test result for seekers
     """
-    rng = _rng(seed)
+    # Offset from `seed` so this RNG stream never collides with the one used
+    # by generate_population(seed=...): callers (repeat_eval, the bias and
+    # misclassification sweeps) pass the SAME seed to both functions, and
+    # both functions' first draw is an N-length rng.random(N) array (for
+    # 'vacc' there, for 'seek' here). With the same seed those two arrays
+    # are bit-for-bit identical, which spuriously ties who is vaccinated to
+    # who seeks care, swamping the intended delta_seek effect.
+    rng = _rng(seed + 1_000_003)
     pr_seek = care_seek_prob(df["severity"].values, df["vacc"].values, delta_seek=delta_seek)
     seek = (rng.random(len(df)) < pr_seek).astype(int)
 
     test_pos = np.zeros(len(df), dtype=int)
     idx_seek = seek == 1
+    # Also offset from the seek draw above, for the same reason: reusing the
+    # same seed for testing would make the test-outcome stream an exact
+    # prefix of the seek-outcome stream.
     test_pos[idx_seek] = apply_test(
         df.loc[idx_seek, "infected_true"].values,
-        sens=sens, spec=spec, seed=seed
+        sens=sens, spec=spec, seed=seed + 2_000_003
     )
 
     out = df.copy()
